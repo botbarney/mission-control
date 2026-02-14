@@ -1,10 +1,10 @@
 const CACHE_NAME = 'mission-control-v1';
 const STATIC_ASSETS = [
   '/',
-  '/index.html',
-  '/manifest.json',
+  '/api/task-tracker',
+  '/api/activity',
   '/icons/icon-192x192.png',
-  '/icons/icon-512x512.png',
+  '/icons/icon-512x512.png'
 ];
 
 // Install event - cache static assets
@@ -14,8 +14,6 @@ self.addEventListener('install', (event) => {
     caches.open(CACHE_NAME).then((cache) => {
       console.log('[SW] Caching static assets');
       return cache.addAll(STATIC_ASSETS);
-    }).catch((err) => {
-      console.error('[SW] Cache failed:', err);
     })
   );
   self.skipWaiting();
@@ -29,85 +27,89 @@ self.addEventListener('activate', (event) => {
       return Promise.all(
         cacheNames
           .filter((name) => name !== CACHE_NAME)
-          .map((name) => {
-            console.log('[SW] Deleting old cache:', name);
-            return caches.delete(name);
-          })
+          .map((name) => caches.delete(name))
       );
     })
   );
   self.clients.claim();
 });
 
-// Fetch event - network first, fallback to cache
+// Fetch event - serve from cache, fallback to network
 self.addEventListener('fetch', (event) => {
+  const { request } = event;
+  
   // Skip non-GET requests
-  if (event.request.method !== 'GET') return;
-
-  // Skip API calls - always go to network
-  if (event.request.url.includes('/api/')) {
-    event.respondWith(fetch(event.request));
+  if (request.method !== 'GET') return;
+  
+  // API requests - network first, cache fallback
+  if (request.url.includes('/api/')) {
+    event.respondWith(
+      fetch(request)
+        .then((response) => {
+          // Cache successful API responses
+          if (response.ok) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then((cache) => {
+              cache.put(request, clone);
+            });
+          }
+          return response;
+        })
+        .catch(() => {
+          // Return cached data if network fails
+          return caches.match(request).then((cached) => {
+            if (cached) return cached;
+            // Return empty data if nothing cached
+            return new Response(JSON.stringify({ offline: true }), {
+              headers: { 'Content-Type': 'application/json' }
+            });
+          });
+        })
+    );
     return;
   }
-
+  
+  // Static assets - cache first, network fallback
   event.respondWith(
-    fetch(event.request)
-      .then((response) => {
-        // Clone the response before caching
-        const responseToCache = response.clone();
-        caches.open(CACHE_NAME).then((cache) => {
-          cache.put(event.request, responseToCache);
-        });
+    caches.match(request).then((cached) => {
+      if (cached) return cached;
+      
+      return fetch(request).then((response) => {
+        // Cache new static assets
+        if (response.ok && (request.url.includes('/icons/') || request.url.includes('/_next/'))) {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => {
+            cache.put(request, clone);
+          });
+        }
         return response;
-      })
-      .catch(() => {
-        // Fallback to cache if network fails
-        return caches.match(event.request).then((cachedResponse) => {
-          if (cachedResponse) {
-            return cachedResponse;
-          }
-          // If not in cache and network failed, return offline page
-          if (event.request.mode === 'navigate') {
-            return caches.match('/');
-          }
-        });
-      })
+      });
+    })
   );
 });
 
-// Background sync for offline form submissions
+// Background sync for notifications
 self.addEventListener('sync', (event) => {
-  if (event.tag === 'sync-activity') {
-    console.log('[SW] Background sync triggered');
-    // Handle background sync if needed
+  if (event.tag === 'check-alerts') {
+    event.waitUntil(checkAlerts());
   }
 });
 
-// Push notification support
-self.addEventListener('push', (event) => {
-  const data = event.data?.json() ?? {};
-  const options = {
-    body: data.body || 'New activity in Mission Control',
-    icon: '/icons/icon-192x192.png',
-    badge: '/icons/icon-72x72.png',
-    tag: data.tag || 'mission-control',
-    requireInteraction: data.requireInteraction || false,
-    data: data.data || {},
-    actions: data.actions || []
-  };
-
-  event.waitUntil(
-    self.registration.showNotification(
-      data.title || 'Mission Control Alert',
-      options
-    )
-  );
-});
-
-// Notification click handler
-self.addEventListener('notificationclick', (event) => {
-  event.notification.close();
-  event.waitUntil(
-    clients.openWindow('/')
-  );
-});
+async function checkAlerts() {
+  try {
+    const response = await fetch('/api/alerts');
+    const alerts = await response.json();
+    
+    alerts.forEach((alert) => {
+      self.registration.showNotification('Mission Control Alert', {
+        body: alert,
+        icon: '/icons/icon-192x192.png',
+        badge: '/icons/icon-72x72.png',
+        tag: 'mission-control-alert',
+        requireInteraction: true
+      });
+    });
+  } catch (error) {
+    console.error('[SW] Alert check failed:', error);
+  }
+}
